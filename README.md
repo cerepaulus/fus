@@ -16,7 +16,7 @@ I wanted to create Python notebooks where you could transparently see how what t
 
 ## Requirements
 
-To maximize legibility, we do as much as possible in base Python, numpy, scipy and matplotlib. The 3rd tutorial uses Numba for acceleration. The 4th tutorial requires the installation of the [CaImAn package](https://github.com/flatironinstitute/CaImAn). The 5th tutorial uses `curl` to download a single session (~300 MB) of the [Griggs et al. (2025) dataset](https://data.caltech.edu/records/p5jan-02r60).
+To maximize legibility, we do as much as possible in base Python, numpy, scipy and matplotlib. The 3rd tutorial uses Numba for acceleration. The 4th tutorial requires the installation of the [CaImAn package](https://github.com/flatironinstitute/CaImAn). The 5th tutorial uses `curl` to download a single session (~580 MB) of the [Griggs et al. (2025) dataset](https://data.caltech.edu/records/p5jan-02r60).
 
 To set up the environment to run all tutorials, in a clean environment:
 
