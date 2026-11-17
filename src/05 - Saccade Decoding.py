@@ -110,7 +110,13 @@ plt.show()
 #
 # # Trial structure
 #
-# On each trial, the monkey fixates a central point, a peripheral target is flashed at one of 8 locations (the *cue*), and the monkey has to keep fixating while remembering that location (the *memory* period). When the fixation point disappears, it makes a saccade to the remembered location (*target acquire*) and gets a reward.
+# The monkeys performed a *memory-guided saccade* task:
+#
+# <img src="images/task_overview.png" width="900">
+#
+# *The task, adapted from Griggs et al. (2025), Fig. 2A. Subject P is the monkey we'll analyze.*
+#
+# On each trial, the monkey fixates a central point. A peripheral target is flashed for 0.4 s at one of 8 locations (the *cue*), and the monkey has to keep fixating while remembering that location (the *memory* period, 5 ± 1 s for monkey P). When the fixation point disappears, it makes a saccade to the remembered location (*target acquire*), holds its gaze there, and gets a reward. Here are the event times recorded on every trial of our session:
 
 # %%
 events = ["fixationhold", "cue", "memory", "target_acquire", "reward", "iti"]
@@ -139,20 +145,9 @@ for ev in ["cue", "target_acquire"]:
 #
 # # Event-locked responses
 #
-# We'll measure responses as a percent change relative to the frames before the cue. The earliest cue happens at 4.3 s, so frames 0-3 (0-4 s) form a clean baseline.
-
-# %%
-baseline = slice(0, 4)  # frames before the earliest cue
-
-base = D[:, baseline].mean(axis=1, keepdims=True)  # per-trial baseline
-with np.errstate(divide="ignore", invalid="ignore"):
-    pct = (D - base) / D[:, baseline].mean(axis=(0, 1)) * 100  # % of the pixel's average baseline
-pct[:, :, ~valid] = np.nan
-
-# %% [markdown]
-# The cue comes at a slightly different time on each trial, so from now on we'll align frames to it. Frame 0 *after the cue* is the first full frame after the cue on that trial.
+# The cue comes at a slightly different time on each trial, so we'll align frames to it. Frame 0 *after the cue* is the first full frame after the cue on that trial; on a typical trial, it starts about half a second after the cue.
 #
-# Which pixels respond during the memory period? The memory period lasts ~5 s, from the cue to the saccade, and blood volume lags neural activity by a couple of seconds. So we'll average frames 2-5 after the cue (2-6 s) and compute a one-sample t-statistic over trials.
+# We'll measure responses as a percent change from a baseline just before the cue, as the paper does (Fig. 3B): the 4 frames before frame 0. The last of them overlaps the cue, but blood volume takes a couple of seconds to respond, so it is still a clean baseline. Why not use the start of the trial as a baseline? In this session, blood volume drifts down by several percent while the monkey fixates, so everything after the cue would look like a decrease.
 
 # %%
 first_after_cue = np.ceil(S.events["cue"] * S.frame_rate).astype(int)
@@ -164,92 +159,70 @@ def after_cue(A, j):
     return A[np.arange(n_trials), first_after_cue + j]
 
 
-memory = range(2, 6)  # frames 2-5 after the cue
-response = np.mean([after_cue(pct, j) for j in memory], axis=0)  # (trials, nz, nx)
-t_task, _ = stats.ttest_1samp(response, 0, axis=0)
+baseline = range(-4, 0)  # the 4 frames before frame 0 after the cue
 
-roi = valid & (t_task > np.nanpercentile(t_task, 98))  # top 2% most responsive pixels
 
-plt.figure(figsize=(6, 6))
-plt.imshow(np.log(S.angiogram), cmap="gray", extent=S.extent)
-plt.imshow(t_task, cmap="RdBu_r", vmin=-10, vmax=10, alpha=0.7, extent=S.extent)
-plt.colorbar(label="t (response vs. baseline)", shrink=0.8)
-plt.contour(roi.astype(float), levels=[0.5], colors="k", linewidths=0.8, extent=S.extent, origin="upper")
-plt.xlabel("Lateral position (mm)")
-plt.ylabel("Depth (mm)")
-plt.title("Task-evoked response (outline: top 2% of pixels)")
-plt.show()
+def to_pct(A):
+    """Percent change from each trial's baseline, relative to the pixel's average baseline."""
+    base = np.mean([after_cue(A, j) for j in baseline], axis=0)[:, None]  # (trials, 1, ...)
+    return (A - base) / base.mean(axis=0, keepdims=True) * 100
+
+
+with np.errstate(divide="ignore", invalid="ignore"):
+    pct = to_pct(D)
+pct[:, :, ~valid] = np.nan
 
 # %% [markdown]
-# Only some regions increase their blood volume during the memory period; much of the tissue actually *decreases* relative to the pre-cue baseline. Blood is being redistributed rather than uniformly added. Let's focus on the most strongly increasing pixels (outlined). Most of them are near the brain surface, in the upper right of the image; we'll come back to the sulcus when we look at direction tuning.
-#
-# What does the response look like over time in these pixels? Let's compare it with the canonical hemodynamic response function (HRF) we used in notebook 4. If neurons are active from the cue to the saccade, the predicted response is that period convolved with the HRF.
+# Let's watch the response unfold, separately for contralateral (rightward) and ipsilateral (leftward) saccades. To make the maps less noisy, we smooth them slightly, with a 1-pixel-radius disk (the paper uses a Gaussian about one pixel wide).
 
 # %%
-def canonical_hrf(t, peak_delay=6.0, undershoot_delay=16.0, peak_to_undershoot=6.0):
-    """SPM-style double-gamma HRF (as in notebook 4), normalized to unit area."""
-    h = stats.gamma.pdf(t, peak_delay) - stats.gamma.pdf(t, undershoot_delay) / peak_to_undershoot
-    return h / h.sum()
+# On a typical trial: when frame 0 starts, and when the memory period ends (the saccade), after the cue
+frame_offset = np.median(first_after_cue / S.frame_rate - S.events["cue"])
+saccade = np.median(S.events["target_acquire"] - S.events["cue"])
 
 
-# Predicted response for each trial: neural activity from cue to saccade, convolved with the HRF
-t_fine = np.arange(0, n_frames, 0.1)
-frame_centers = np.arange(n_frames) + 0.5
-hrf = canonical_hrf(np.arange(0, 30, 0.1))
-predicted = []
-for cue, saccade in zip(S.events["cue"], S.events["target_acquire"]):
-    neural = ((t_fine >= cue) & (t_fine < saccade)).astype(float)
-    predicted.append(np.interp(frame_centers, t_fine, np.convolve(neural, hrf)[: len(t_fine)]))
-predicted = np.mean(predicted, axis=0)
+def frame_time(j):
+    """Middle of frame j after the cue, in seconds after the cue (typical trial)."""
+    return frame_offset + (np.asarray(j) + 0.5) / S.frame_rate
 
-roi_tc = pct[:, :, roi].mean(axis=2)  # (trials, frames)
-mean_tc = roi_tc.mean(axis=0)
-sem_tc = roi_tc.std(axis=0) / np.sqrt(n_trials)
-gain, offset = np.linalg.lstsq(np.vstack([predicted, np.ones(n_frames)]).T, mean_tc, rcond=None)[0]
 
-plt.figure(figsize=(8, 4))
-plt.fill_between(frame_centers, mean_tc - sem_tc, mean_tc + sem_tc, alpha=0.3)
-plt.plot(frame_centers, mean_tc, "o-", label="measured (mean ± s.e.m.)")
-plt.plot(frame_centers, gain * predicted + offset, "k--", label=f"canonical HRF (r = {np.corrcoef(predicted, mean_tc)[0, 1]:.2f})")
-for ev, color in [("cue", "g"), ("target_acquire", "r")]:
-    plt.axvline(np.median(S.events[ev]), color=color, linestyle=":", label=f"{ev} (median)")
-typical_first = np.median(first_after_cue)
-plt.axvspan(typical_first + memory.start, typical_first + memory.stop, color="gray", alpha=0.1, label="memory window (typical trial)")
-plt.xlabel("Time from trial start (s)")
-plt.ylabel("CBV change (%)")
-plt.title("Event-locked response in the most responsive pixels")
-plt.legend(fontsize=8)
-plt.show()
-
-# %% [markdown]
-# Blood volume starts rising ~2 s after the cue, reaches ~12% during the memory period, and peaks at ~17% about 3 s after the saccade. The canonical HRF captures the overall shape, but not the details: the measured response rises earlier and comes back down faster. That's not too surprising—the canonical HRF was derived from BOLD fMRI, CBV responses have their own dynamics, and the reward and the end of the trial drive activity too.
-#
-# Note the size of the response: 10-17% is an order of magnitude larger than typical BOLD signal changes. Remember this, it will matter later.
-#
-# # Direction tuning maps
-#
-# The response above is averaged over all 8 directions. Do different pixels prefer different directions? The paper smooths the images slightly before mapping tuning (with a Gaussian about one pixel wide); we'll use a 1-pixel-radius disk. Let's start with the simplest contrast: contralateral (rightward) vs. ipsilateral (leftward) saccades, during the memory period.
-
-# %%
 disk = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=float)
 disk /= disk.sum()
-response_smooth = convolve(np.nan_to_num(response), disk[None], mode="nearest")
-response_smooth[:, ~valid] = np.nan
+
+
+def smooth(A):
+    """Smooth images (the last two axes) with the disk, keeping only valid pixels."""
+    out = convolve(np.nan_to_num(A), disk.reshape((1,) * (A.ndim - 2) + disk.shape), mode="nearest")
+    out[..., ~valid] = np.nan
+    return out
+
 
 right = np.isin(S.target_deg, [315, 0, 45])  # contralateral
 left = np.isin(S.target_deg, [135, 180, 225])  # ipsilateral
-t_contra, _ = stats.ttest_ind(response_smooth[right], response_smooth[left], axis=0)
 
-plt.figure(figsize=(6, 6))
-plt.imshow(t_contra, cmap="RdBu_r", vmin=-6, vmax=6, extent=S.extent)
-plt.colorbar(label="t (contralateral - ipsilateral)", shrink=0.8)
-plt.xlabel("Lateral position (mm)")
-plt.ylabel("Depth (mm)")
-plt.title("Contralateral vs. ipsilateral saccades")
+shown = [-1, 1, 3, 5, 7, 9]  # frames after the cue
+fig, axes = plt.subplots(3, len(shown), figsize=(15, 7.5))
+for col, j in enumerate(shown):
+    frame = after_cue(pct, j)
+    contra, ipsi = smooth(frame[right].mean(axis=0)), smooth(frame[left].mean(axis=0))
+    for row, image in enumerate([contra, ipsi, contra - ipsi]):
+        im = axes[row, col].imshow(image, cmap="RdBu_r", vmin=-10, vmax=10, extent=S.extent)
+        axes[row, col].set_xticks([])
+        axes[row, col].set_yticks([])
+    axes[0, col].set_title(f"{round(float(frame_time(j)))} s after the cue")
+for row, label in enumerate(["Contralateral\n(rightward)", "Ipsilateral\n(leftward)", "Contralateral\nminus ipsilateral"]):
+    axes[row, 0].set_ylabel(label)
+fig.colorbar(im, ax=axes, shrink=0.6, label="CBV change (%)")
 plt.show()
 
 # %% [markdown]
-# Now let's use all 8 directions. For each pixel, we test whether the response differs across directions (one-way ANOVA), and summarize its preferred direction as the direction of the vector sum of its responses, $\sum_k r_k e^{i \theta_k}$. Compare the result with the paper's Fig. 3A, which shows this session.
+# Around the cue, the maps are close to zero, as they should be: that's our baseline. About 2 s after the cue, blood volume drops over much of the upper left of the image; at 4 s, it rises by more than 10% in a patch at the top of the sulcus; and after the saccade (~5.4 s after the cue), it rises across most of the upper part of the image, by 10% and more. So whether a given pixel seems to gain or lose blood depends very much on when we look. And nearly all of these changes are the same for both directions: they reflect the task as a whole (fixating, seeing the cue, making a saccade, getting a reward) rather than where the monkey is going to look.
+#
+# The bottom row isolates what *is* specific to the direction. During the memory period, a band along the sulcus responds more to contralateral saccades, and it isn't where the largest overall responses are. That's the signal we're after.
+#
+# ## When are responses tuned to direction?
+#
+# To map direction tuning, we'll average a few frames after the cue. Which ones? Let's measure, frame by frame, how many pixels respond differently to the 8 directions: for each pixel, a one-way ANOVA tests whether its response differs across directions. While we're at it, we summarize each pixel's preferred direction as the direction of the vector sum of its mean responses, $\sum_k r_k e^{i \theta_k}$; we'll need it shortly.
 
 # %%
 directions = np.unique(S.target_deg)
@@ -265,6 +238,39 @@ def direction_tuning(response):
     return p, np.degrees(np.angle(vector_sum)) % 360
 
 
+frames = np.arange(-4, n_after)  # frames after the cue (negative: before the cue)
+n_tuned = [np.sum(valid & (direction_tuning(smooth(after_cue(pct, j)))[0] < 1e-3)) for j in frames]
+avg_window = range(3, 7)  # the frames we'll average: 3-6 after the cue
+
+
+def shade_periods(ax, window=True):
+    """Shade the memory period and, optionally, the averaging window, on an axis of time after the cue."""
+    ax.axvspan(0, saccade, color="gray", alpha=0.15, label="memory period (cue to saccade, median)")
+    if window:
+        ax.axvspan(frame_offset + avg_window.start / S.frame_rate, frame_offset + avg_window.stop / S.frame_rate,
+                   facecolor="none", edgecolor="C1", hatch="//", label="averaging window (typical trial)")
+
+
+fig, ax = plt.subplots(figsize=(8, 4))
+shade_periods(ax)
+ax.plot(frame_time(frames), n_tuned, "o-", color="k")
+ax.axhline(1e-3 * valid.sum(), color="k", linestyle="--", linewidth=1, label="expected by chance")
+ax.set_xlabel("Time after the cue (s)")
+ax.set_ylabel("Pixels tuned to direction (p < 0.001)")
+ax.set_title("Direction tuning, frame by frame")
+ax.legend(fontsize=8)
+plt.show()
+
+# %% [markdown]
+# Direction tuning appears ~2 s after the cue, peaks about 5 s after it, around the time of the saccade, and then fades, even as the large post-saccade response builds up. The delay is the hemodynamic lag at work: blood volume follows neural activity with a delay of a couple of seconds, so the frames around the peak mostly reflect activity during the memory period. We'll average frames 3-6 after the cue (hatched), which cover the peak of the tuning. The paper also places its analysis window around the time of the saccade (Fig. 3B).
+#
+# # Direction tuning maps
+#
+# Now let's map, for every pixel, whether its averaged response is tuned to direction, and which direction it prefers.
+
+# %%
+response = np.mean([after_cue(pct, j) for j in avg_window], axis=0)  # (trials, nz, nx)
+response_smooth = smooth(response)
 p_anova, preferred = direction_tuning(response_smooth)
 tuned = valid & (p_anova < 1e-3)
 print(f"{tuned.sum()} pixels tuned to direction at p < 0.001 ({1e-3 * valid.sum():.0f} expected by chance)")
@@ -296,7 +302,9 @@ wheel.set_xticklabels(["right\n(contra)", "up", "left", "down"], fontsize=7)
 plt.show()
 
 # %% [markdown]
-# Most tuned pixels form one large cluster along the sulcus, and nearly all of them prefer contralateral (rightward) or upward saccades—consistent with the paper, which finds that over 85% of tuned LIP voxels prefer contralateral directions. Within the cluster, the preference changes from rightward at the top to upward further down, in patches. Let's look at tuning curves in two small (0.4 × 0.4 mm) regions of the cluster with different preferences.
+# Most tuned pixels form one large cluster along the sulcus, and nearly all of them prefer contralateral (rightward) or upward saccades—consistent with the paper, which finds that over 85% of tuned LIP voxels prefer contralateral directions. Within the cluster, the preference changes from rightward at the top to upward further down, in patches. The paper's Fig. 3A shows this session differently, as one map of response strength per direction, but the same cluster along the sulcus stands out there too, responding most to contralateral and upward saccades.
+#
+# Let's look at tuning curves in two small (0.4 × 0.4 mm) regions of the cluster with different preferences.
 
 # %%
 def tuning_curve(center, size=4):
@@ -340,7 +348,61 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# Even within a single cluster, regions less than 1.5 mm apart are tuned differently: region A is sharply tuned to upward saccades, while region B is more broadly tuned, peaking up and to the right and still responding to rightward saccades. Both are suppressed during leftward and downward saccades. The paper's Fig. 3C finds the same mix of broadly and narrowly tuned regions in this session. This is the kind of mesoscopic organization that the paper argues fMRI can't resolve. But being able to *see* fine-grained maps and being able to *use* the information they contain are two different things. Let's build a decoder.
+# Even within a single cluster, regions less than 1.5 mm apart are tuned differently: region A is sharply tuned to upward saccades, while region B is more broadly tuned, peaking up and to the right and still responding to rightward saccades. Neither responds much to leftward or downward saccades. The paper's Fig. 3C finds the same mix of broadly and narrowly tuned regions in this session.
+#
+# How do these responses unfold over time? Let's plot the response of each region to each direction, aligned to the cue (compare with the paper's Fig. 3B). We'll also compare them with the canonical hemodynamic response function (HRF) we used in notebook 4: if neurons are active from the cue to the saccade, the predicted response is that period convolved with the HRF.
+
+# %%
+def canonical_hrf(t, peak_delay=6.0, undershoot_delay=16.0, peak_to_undershoot=6.0):
+    """SPM-style double-gamma HRF (as in notebook 4), normalized to unit area."""
+    h = stats.gamma.pdf(t, peak_delay) - stats.gamma.pdf(t, undershoot_delay) / peak_to_undershoot
+    return h / h.sum()
+
+
+# Predicted response on each trial: neural activity from the cue to the saccade, convolved with the HRF
+t_fine = np.arange(0, n_frames, 0.1)
+hrf = canonical_hrf(np.arange(0, 30, 0.1))
+frame_centers = (np.arange(n_frames) + 0.5) / S.frame_rate
+predicted = np.array([
+    np.interp(frame_centers, t_fine, np.convolve(((t_fine >= cue) & (t_fine < sacc)).astype(float), hrf)[: len(t_fine)])
+    for cue, sacc in zip(S.events["cue"], S.events["target_acquire"])
+])  # (trials, frames)
+predicted = np.array([after_cue(predicted, j).mean() for j in frames])  # cue-aligned, averaged over trials
+
+
+def region_time_course(center, size=4):
+    """Cue-aligned response of a size x size pixel region around `center`: (trials, frames)."""
+    iz, ix = center
+    per_trial = np.nanmean(pct[:, :, iz - size // 2 : iz + size // 2, ix - size // 2 : ix + size // 2], axis=(2, 3))
+    return np.stack([after_cue(per_trial, j) for j in frames], axis=1)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.5), sharey=True)
+for ax, center, label in [(axes[0], first, "A"), (axes[1], second, "B")]:
+    tc = region_time_course(center)
+    shade_periods(ax)
+    means = np.array([tc[S.target_deg == d].mean(axis=0) for d in directions])
+    for d, mean in zip(directions, means):
+        ax.plot(frame_time(frames), mean, "o-", markersize=3, color=hsv_to_rgb([d / 360, 1, 0.85]), label=f"{d:.0f}°")
+    # Fit the predicted response (gain and offset) to the region's preferred direction
+    best = means[np.argmax(means[:, np.isin(frames, avg_window)].mean(axis=1))]
+    gain, offset = np.linalg.lstsq(np.vstack([predicted, np.ones_like(predicted)]).T, best, rcond=None)[0]
+    r = np.corrcoef(predicted, best)[0, 1]
+    ax.plot(frame_time(frames), gain * predicted + offset, "k--", label="canonical HRF\n(fit to the best direction)")
+    ax.axhline(0, color="k", linewidth=0.5)
+    ax.set_xlabel("Time after the cue (s)")
+    ax.set_title(f"Region {label}: response to each direction (HRF fit: r = {r:.2f})")
+axes[0].set_ylabel("CBV change (%)")
+axes[1].legend(fontsize=7, loc="upper left", bbox_to_anchor=(1.02, 1))
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
+# Both regions respond to their preferred directions within ~2 s of the cue, keep rising through the memory period, and peak 2-3 s after the saccade, at roughly 20-25% above baseline. Responses to the other directions stay close to baseline, or even dip below it: region A's blood volume *drops* by over 10% during rightward and down-rightward saccades. The canonical HRF captures the overall shape of the preferred responses, even though it was derived from BOLD fMRI and CBV responses have their own dynamics.
+#
+# Note the size of these responses: 20-25% is an order of magnitude larger than typical BOLD signal changes. Remember this, it will matter later.
+#
+# This is the kind of mesoscopic organization that the paper argues fMRI can't resolve. But being able to *see* fine-grained maps and being able to *use* the information they contain are two different things. Let's build a decoder.
 #
 # # Decoding single trials
 #
@@ -361,12 +423,6 @@ pillbox = (np.hypot(*np.mgrid[-2:3, -2:3]) <= 2).astype(np.float32)
 pillbox /= pillbox.sum()
 decode_valid = binary_erosion(valid, pillbox > 0)  # pixels whose whole pillbox is inside the valid image
 D_smooth = np.where(decode_valid, convolve(D, pillbox[None, None], mode="nearest"), np.nan)
-
-
-def to_pct(A):
-    """Percent change from each trial's baseline, relative to the average baseline (as for `pct`)."""
-    base = A[:, baseline].mean(axis=1, keepdims=True)
-    return (A - base) / base.mean(axis=0, keepdims=True) * 100
 
 
 def gram(F):
@@ -488,18 +544,23 @@ plt.show()
 
 # %%
 confusion = np.zeros((8, 8))
-for true, predicted in zip(y8, pred8):
-    confusion[true, predicted] += 1
+for true, guess in zip(y8, pred8):
+    confusion[true, guess] += 1
 confusion /= confusion.sum(axis=1, keepdims=True)
+
+# Same order as the paper's Fig. 4B: clockwise from up-left
+paper_order = [list(directions).index(d) for d in [135, 90, 45, 0, 315, 270, 225, 180]]
+arrows = {0: "→", 45: "↗", 90: "↑", 135: "↖", 180: "←", 225: "↙", 270: "↓", 315: "↘"}
+labels = [f"{arrows[directions[i]]} {directions[i]:.0f}°" for i in paper_order]
 
 angular_error = np.abs((directions[pred8] - directions[y8] + 180) % 360 - 180)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-im = ax1.imshow(confusion, cmap="viridis", vmin=0, vmax=1)
+im = ax1.imshow(confusion[np.ix_(paper_order, paper_order)], cmap="viridis", vmin=0, vmax=1)
 ax1.set_xticks(range(8))
-ax1.set_xticklabels([f"{d:.0f}°" for d in directions])
+ax1.set_xticklabels(labels, rotation=90)
 ax1.set_yticks(range(8))
-ax1.set_yticklabels([f"{d:.0f}°" for d in directions])
+ax1.set_yticklabels(labels)
 ax1.set_xlabel("Predicted direction")
 ax1.set_ylabel("True direction")
 ax1.set_title("Confusion matrix (fraction of trials)")
@@ -517,9 +578,9 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# Most errors are to neighboring directions: the decoder knows roughly where the monkey will look even when it gets the exact target wrong. Rightward and upward directions are decoded best, and leftward ones worst, which fits the map above: few pixels prefer leftward saccades.
+# Most errors are to neighboring directions: the decoder knows roughly where the monkey will look even when it gets the exact target wrong. Upward, up-left and rightward saccades are decoded best, and leftward ones worst: they are mostly mistaken for down-left ones, as in the paper's Fig. 4B. The decoder also has a soft spot for 135° (up-left): when the evidence is weak, as for leftward and downward saccades, that's where many of its guesses go.
 #
-# The paper reports 59.6% correct and a mean angular error of 23.7° for this session (Fig. 4A). We're a few points short. Our pipeline is simpler: the paper uses leave-one-out cross-validation, so each decoder trains on ~10% more trials, and its preprocessing differs in the details (for instance, it removes slow drifts by detrending, where we subtract each trial's baseline).
+# The paper reports 59.6% correct and a mean angular error of 23.7° for this session (Fig. 4A). We're close. Our pipeline is simpler: the paper uses leave-one-out cross-validation, so each decoder trains on ~10% more trials, and its preprocessing differs in the details (for instance, it removes slow drifts by detrending, where we subtract each trial's baseline).
 #
 # ## When does the information appear?
 #
@@ -530,8 +591,7 @@ cumulative = np.cumsum(grams, axis=0)
 acc8_t = [decode(G, y8)[0] for G in cumulative]
 acc_lr_t = [decode(G[np.ix_(lateral, lateral)], y_lr[lateral])[0] for G in cumulative]
 # When the last frame used ends, relative to the cue (typical trial)
-t_after = np.median(first_after_cue / S.frame_rate - S.events["cue"]) + np.arange(1, n_after + 1) / S.frame_rate
-go = np.median(S.events["target_acquire"] - S.events["cue"])
+t_after = frame_offset + np.arange(1, n_after + 1) / S.frame_rate
 
 fig, axes = plt.subplots(1, 2, figsize=(13, 4))
 for ax, acc, chance, n, title in [
@@ -539,9 +599,9 @@ for ax, acc, chance, n, title in [
     (axes[1], acc_lr_t, 1 / 2, lateral.sum(), "Left vs. right"),
 ]:
     lo, hi = stats.binom.ppf([0.025, 0.975], n, chance) / n
-    ax.fill_between([0, t_after[-1]], lo, hi, color="gray", alpha=0.3, label="chance (95%)")
+    shade_periods(ax, window=False)
+    ax.fill_between([0, t_after[-1]], lo, hi, color="C3", alpha=0.2, label="chance (95%)")
     ax.plot(t_after, acc, "o-", label="decoding accuracy")
-    ax.axvline(go, color="r", linestyle=":", label="end of memory period (median)")
     ax.set_xlabel("Time after the cue, at the end of the last frame used (s)")
     ax.set_ylabel("Accuracy")
     ax.set_ylim(0, 1)
@@ -551,7 +611,7 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# Decoding rises above chance 2-3 s after the cue: neurons in LIP start encoding the target as soon as it's flashed, but blood volume takes a few seconds to follow. By the end of the memory period, the decoder is right on ~40% of trials (left vs. right: ~80%), and it keeps improving for a few more seconds as it takes in the frames around the saccade, before leveling off at ~55%. The paper also finds that decoding becomes significant within 3 s of the cue (Fig. 4A). Some of the late information is about the movement itself rather than the plan: by then, the monkey has made its saccade, and blood volume is still catching up. This lag is the price of measuring neural activity through hemodynamics—with fUS just as with fMRI.
+# Decoding rises above chance about 3 s after the cue: neurons in LIP start encoding the target as soon as it's flashed, but blood volume takes a few seconds to follow. By the end of the memory period, the decoder is right on ~45% of trials (left vs. right: ~85%), and it keeps improving for a few more seconds as it takes in the frames around the saccade, before leveling off at ~58%. The paper also finds that decoding becomes significant within 3 s of the cue (Fig. 4A). Some of the late information is about the movement itself rather than the plan: by then, the monkey has made its saccade, and blood volume is still catching up. This lag is the price of measuring neural activity through hemodynamics—with fUS just as with fMRI.
 #
 # # The fMRI question
 #
@@ -564,6 +624,8 @@ plt.show()
 # %%
 def block_average(A, f):
     """Average non-overlapping f x f pixel blocks over the last two axes, ignoring NaNs."""
+    if f == 1:
+        return A  # nothing to average
     Z, X = (A.shape[-2] // f) * f, (A.shape[-1] // f) * f
     blocks = A[..., :Z, :X].reshape(*A.shape[:-2], Z // f, f, X // f, f)
     n_valid = np.isfinite(blocks).sum(axis=(-3, -1))
@@ -602,7 +664,7 @@ for col, f in enumerate([1, 5, 15]):
     axes[0, col].set_title(f"{f * S.dx_mm:.1f} mm voxels")
 
     Vp = voxel_pct(f)
-    p, pref = direction_tuning(np.mean([after_cue(Vp, j) for j in memory], axis=0))
+    p, pref = direction_tuning(np.mean([after_cue(Vp, j) for j in avg_window], axis=0))
     good = np.isfinite(p) & (p < 1e-3)
     axes[1, col].imshow(direction_map(pref, good, angio), extent=S.extent)
     axes[1, col].set_title(f"Preferred direction, {f * S.dx_mm:.1f} mm voxels")
@@ -641,7 +703,7 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# Mild averaging (0.2-0.5 mm) slightly *helps*: it averages out noise faster than it destroys signal, and decoding holds up all the way to 1 mm voxels. Beyond that, it drops: at 1.5-2 mm, where the direction map has collapsed to a handful of voxels, 8-direction accuracy falls by 7-13 points, and left vs. right by 8-13 points. So resolution does matter for decoding here, but even 2 mm voxels keep much of the information, mixed together in ways a linear decoder can partly untangle.
+# Mild averaging (0.2-0.5 mm) slightly *helps*: it averages out noise faster than it destroys signal, and decoding holds up all the way to 1 mm voxels. Beyond that, it drops: at 1.5-2 mm, where the direction map has collapsed to a handful of voxels, 8-direction accuracy falls by 7-15 points, and left vs. right by 9-12 points. So resolution does matter for decoding here, but even 2 mm voxels keep much of the information, mixed together in ways a linear decoder can partly untangle.
 #
 # ## Temporal resolution
 #
@@ -649,14 +711,13 @@ plt.show()
 
 # %%
 frames_after = np.stack([after_cue(pct_smooth, j)[:, decode_valid] for j in range(n_after)], axis=1)
-start = np.median(first_after_cue / S.frame_rate - S.events["cue"])  # when frame 0 starts, after the cue
 
 fig, ax = plt.subplots(figsize=(8, 4))
+shade_periods(ax, window=False)
 for TR in [1, 2, 3]:
     n_bins = n_after // TR
     acc = [decode(gram(frames_after[:, b * TR : (b + 1) * TR].mean(axis=1)), y8)[0] for b in range(n_bins)]
-    ax.step(start + np.arange(n_bins + 1) * TR, acc + acc[-1:], where="post", label=f"TR = {TR} s")
-ax.axvline(go, color="r", linestyle=":", label="end of memory period (median)")
+    ax.step(frame_offset + np.arange(n_bins + 1) * TR / S.frame_rate, acc + acc[-1:], where="post", label=f"TR = {TR} s")
 ax.axhline(1 / 8, color="k", linestyle="--", label="chance")
 ax.set_xlabel("Time after the cue (s)")
 ax.set_ylabel("8-direction accuracy")
@@ -675,7 +736,7 @@ del frames_after
 # %%
 noise_by_size, dprime_by_size = [], []
 for f in block_sizes:
-    V = np.mean([after_cue(voxel_responses(f), j) for j in memory], axis=0)  # (trials, voxels), memory period
+    V = np.mean([after_cue(voxel_responses(f), j) for j in avg_window], axis=0)  # (trials, voxels), averaging window
     contrast = V[right].mean(axis=0) - V[left].mean(axis=0)
     noise = np.sqrt((V[right].var(axis=0) + V[left].var(axis=0)) / 2)
     dprime = np.sort(np.abs(contrast) / noise)
@@ -751,7 +812,7 @@ plt.show()
 # %% [markdown]
 # Reading the grid along each axis tells the story:
 #
-# * **Horizontally** (bigger voxels, same noise), accuracy holds up to 1 mm and then drops, by 13 points at 2 mm.
+# * **Horizontally** (bigger voxels, same noise), accuracy holds up to 1 mm and then drops, by 15 points at 2 mm.
 # * **Vertically** (same voxels, more noise), accuracy collapses: doubling the noise costs about twice as much as going from 0.1 mm to 2 mm voxels, and by 3-5x the 8-direction decoder approaches chance.
 # * The two costs add up: with 1.5 mm voxels *and* twice the noise, 8-direction accuracy is down to about a quarter.
 #
@@ -792,7 +853,7 @@ plt.show()
 #
 # # Exercises
 #
-# * Repeat the analysis with session 76, the paper's example session for monkey L (recorded on 24 June 2021, "S20210624"), and compare with the paper's Figs. 3D-F and 4D-F. Two things change: the cue can come as early as 3.8 s, so use frames 0-2 as the baseline; and on 12 of the 555 trials, the cue comes after 6 s, so drop those trials to keep 10 frames after the cue in every trial.
+# * Repeat the analysis with session 76, the paper's example session for monkey L (recorded on 24 June 2021, "S20210624"), and compare with the paper's Figs. 3D-F and 4D-F. One thing to watch: on 12 of the 555 trials, the cue comes after 6 s, so drop those trials to keep 10 frames after the cue in every trial.
 # * For other sessions, check the "units" plot first. In session 39, every pixel carries a large constant offset that you'll need to estimate and subtract (hint: where does the line in that plot cross zero standard deviation?).
 # * The paper decodes the horizontal (left, center, right) and vertical (down, center, up) components of each saccade with two separate LDAs, and combines their predictions. Try it. Does it change the accuracy or the pattern of errors?
 # * Restrict the decoder to the frames before the saccade (accounting for the hemodynamic lag). How much of the information is about the *plan* rather than the movement?
